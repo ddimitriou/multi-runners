@@ -1,0 +1,43 @@
+name: Proof of Work Validator
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - main
+
+jobs:
+  verify-pow:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python environment
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install cryptography
+
+      - name: Verify Proof-of-Work Tokens
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          POW_ADMIN_HANDLES: ${{ secrets.POW_ADMIN_HANDLES }}
+          POW_GITHUB_API_URL: ${{ secrets.POW_GITHUB_API_URL }}
+          POW_CHECKS_CMD: 'docker run --rm -v "$(git rev-parse --show-toplevel)":/pwd trufflesecurity/trufflehog:latest filesystem /pwd --no-verification --fail'
+          # ---------------------------------------------------------------
+          # POW_ENFORCE controls whether validation is active.
+          # Ships as "false" so the initial setup push passes without errors.
+          # Change to "true" on your second commit (made with hooks running)
+          # to enable enforcement for all future pushes.
+          # ---------------------------------------------------------------
+          POW_ENFORCE: "false"
+        run: python3 .github/scripts/verify_pow.py

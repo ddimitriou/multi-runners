@@ -39,5 +39,5 @@ jobs:
           # Change to "true" on your second commit (made with hooks running)
           # to enable enforcement for all future pushes.
           # ---------------------------------------------------------------
-          POW_ENFORCE: "false"
+          POW_ENFORCE: "true"
         run: python3 .github/scripts/verify_pow.py

@@ -261,6 +261,18 @@ def main():
 
         last_valid = commit
 
+    # 5. Server-Side Zero-Trust Validation
+    if missing == 0 and expected_cmd and expected_cmd != "none":
+        print(f"\n⚙️ Executing server-side check: {expected_cmd}")
+        try:
+            # We use subprocess.check_call so output streams directly to GitHub Actions console
+            subprocess.check_call(expected_cmd, shell=True)
+            print("✅ Server-side check passed.")
+        except subprocess.CalledProcessError:
+            print("❌ Server-side check failed. A zero-trust validation error occurred.")
+            missing += 1
+            last_valid = base_sha  # Revert the entire push
+
     # ---- Rejection path ----
     if missing > 0:
         print("\n-------------------------------------------------------")
@@ -334,3 +346,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

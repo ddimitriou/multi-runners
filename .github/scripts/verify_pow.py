@@ -264,6 +264,15 @@ def main():
     # 5. Server-Side Zero-Trust Validation
     if missing == 0 and expected_cmd and expected_cmd != "none":
         print(f"\n⚙️ Executing server-side check: {expected_cmd}")
+
+        # Temporarily hide GitHub token from scanners like Trufflehog
+        extra_header = None
+        try:
+            extra_header = subprocess.check_output(["git", "config", "--local", "--get", "http.https://github.com/.extraheader"]).decode().strip()
+            subprocess.check_call(["git", "config", "--local", "--unset", "http.https://github.com/.extraheader"])
+        except subprocess.CalledProcessError:
+            pass
+
         try:
             # We use subprocess.check_call so output streams directly to GitHub Actions console
             subprocess.check_call(expected_cmd, shell=True)
@@ -272,6 +281,10 @@ def main():
             print("❌ Server-side check failed. A zero-trust validation error occurred.")
             missing += 1
             last_valid = base_sha  # Revert the entire push
+        finally:
+            # Restore the header so git push works in the rejection path
+            if extra_header:
+                subprocess.check_call(["git", "config", "--local", "http.https://github.com/.extraheader", extra_header])
 
     # ---- Rejection path ----
     if missing > 0:
@@ -346,4 +359,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

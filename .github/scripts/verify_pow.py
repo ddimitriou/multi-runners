@@ -71,13 +71,12 @@ def verify_with_github_keys(sig_raw, payload_bytes, username, gh_token):
     """
     from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.hazmat.primitives.asymmetric.ed448 import Ed448PublicKey
+    from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey, ECDSA
 
     ssh_keys = get_github_ssh_keys(username, gh_token)
     if not ssh_keys:
         return False
-
-    from cryptography.hazmat.primitives.asymmetric.ed448 import Ed448PublicKey
-    from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey, ECDSA
 
     for key_str in ssh_keys:
         try:
@@ -134,61 +133,196 @@ def check_attestation_artifact(repo, session_id, expected_hash, gh_token, retrie
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Verifier Modules
 # ---------------------------------------------------------------------------
 
-def main():
-    # POW_ENFORCE is set in the workflow YAML (not a secret).  It ships as
-    # "false" so the initial push that installs the workflow files passes
-    # without errors.  Change it to "true" on the second commit (made with
-    # hooks installed and running) to enable enforcement for all future pushes.
-    if os.environ.get("POW_ENFORCE", "").strip().lower() != "true":
-        print("⚠️  POW_ENFORCE is not \"true\" — validation is disabled.")
-        print("   Set POW_ENFORCE: \"true\" in .github/workflows/pow-validator.yml")
-        print("   on your second commit (made with hooks installed and running).")
-        sys.exit(0)
-
-    gh_token = os.environ.get("GITHUB_TOKEN")
-    repo = os.environ.get("GITHUB_REPOSITORY")  # auto-set by Actions
-
-    expected_cmd = os.environ.get("POW_CHECKS_CMD", "none")
-    expected_hash = hashlib.sha256(expected_cmd.encode()).hexdigest()
-
-    # ---- Resolve commit range ----
+def resolve_commit_range():
+    """Determine the range of commits to verify based on the GitHub event."""
     event_name = os.environ.get("GITHUB_EVENT_NAME")
-    event = {}
+    event_path = os.environ.get("GITHUB_EVENT_PATH")
+    if not event_path:
+        # Local fallback
+        return run("git rev-parse HEAD~1"), run("git rev-parse HEAD"), "main", {}
+
+    with open(event_path) as f:
+        event = json.load(f)
+
     if event_name == "pull_request":
-        with open(os.environ.get("GITHUB_EVENT_PATH")) as f:
-            event = json.load(f)
         base_sha = event["pull_request"]["base"]["sha"]
         head_sha = event["pull_request"]["head"]["sha"]
         ref_name = event["pull_request"]["head"]["ref"]
     else:
-        try:
-            with open(os.environ.get("GITHUB_EVENT_PATH")) as f:
-                event = json.load(f)
-            base_sha = event.get("before")
-            head_sha = event.get("after")
-            ref_name = os.environ.get("GITHUB_REF", "").replace("refs/heads/", "")
+        base_sha = event.get("before")
+        head_sha = event.get("after")
+        ref_name = os.environ.get("GITHUB_REF", "").replace("refs/heads/", "")
 
-            if not base_sha or base_sha == "0" * 40:
-                try:
-                    base_sha = run(f"git merge-base origin/main {head_sha}") if head_sha else "HEAD~1"
-                except Exception:
-                    base_sha = "HEAD~1"
-            if not head_sha:
-                head_sha = "HEAD"
-        except Exception:
-            print("⚠️  Local ACT test fallback triggered")
-            base_sha = run("git rev-parse HEAD~1")
-            head_sha = run("git rev-parse HEAD")
-            ref_name = "main"
+        if not base_sha or base_sha == "0" * 40:
+            try:
+                base_sha = run(f"git merge-base origin/main {head_sha}") if head_sha else "HEAD~1"
+            except Exception:
+                base_sha = "HEAD~1"
+        if not head_sha:
+            head_sha = "HEAD"
 
-    # ---- Enumerate commits ----
+    return base_sha, head_sha, ref_name, event
+
+
+def verify_single_commit(commit, repo, gh_token, expected_hash):
+    """Verify the PoW signature and attestation for a single commit."""
+    print(f"\n🔍 Verifying commit {commit}…")
+
+    pow_checks_b64 = run(f'git log -1 --format="%(trailers:key=PoW-Checks,valueonly)" {commit}')
+    tree_hash = run(f"git log -1 --format=%T {commit}")
+
+    if not pow_checks_b64:
+        print(f"❌ Commit {commit} missing required PoW-Checks trailer.")
+        return False
+
+    try:
+        bundle_json = base64.b64decode(pow_checks_b64).decode()
+        bundle = json.loads(bundle_json)
+        token = bundle["token"]
+        session = bundle["session"]
+        status = bundle["status"]
+        cmd_hash = bundle["checks_hash"]
+    except Exception:
+        print(f"❌ Commit {commit} PoW-Checks trailer is not valid base64 JSON.")
+        return False
+
+    if cmd_hash != expected_hash:
+        print(f"❌ Commit {commit} used incorrect POW_CHECKS_CMD (hash mismatch).")
+        return False
+
+    sign_payload = f"{cmd_hash}|{tree_hash}|{session}|{status}"
+    try:
+        sig_raw = base64.b64decode(token)
+    except Exception:
+        print(f"❌ Commit {commit} token is not valid base64.")
+        return False
+
+    username = get_github_username_for_commit(repo, commit, gh_token)
+    if not username:
+        print(f"❌ Cannot resolve GitHub username for commit {commit}.")
+        return False
+
+    if not verify_with_github_keys(sig_raw, sign_payload.encode(), username, gh_token):
+        print(f"❌ No matching GitHub SSH key for commit {commit} (user: {username}).")
+        return False
+
+    print(f"   ✅ Signature verified via GitHub SSH keys of {username}.")
+
+    if check_attestation_artifact(repo, session, expected_hash, gh_token) is False:
+        print(f"❌ No server-side attestation found for session {session}.")
+        return False
+
+    return True
+
+
+def teardown_pr(repo_name, ref_name, gh_token, admins):
+    """Close linked PRs and notify admins."""
+    try:
+        owner = repo_name.split("/")[0]
+        prs_url = f"{_api_base()}/repos/{repo_name}/pulls?head={owner}:{ref_name}&state=open"
+        req_prs = urllib.request.Request(prs_url, headers={
+            "Authorization": f"Bearer {gh_token}",
+            "Accept": "application/vnd.github.v3+json",
+        })
+        resp = urllib.request.urlopen(req_prs)
+        open_prs = json.loads(resp.read().decode())
+
+        tag = f"{admins} " if admins else ""
+        support_link = "https://support.github.com/contact/general"
+        msg = (
+            f"🚨 **Proof-of-Work Validation Failed**\n\n"
+            f"{tag}This Pull Request received a commit containing an unverified or fraudulent "
+            f"cryptographic signature.\n\n"
+            f"_The PR has been automatically closed and the compromised branch pushed over._\n\n"
+            f"**Manual Action Required:** GitHub does not provide an API to hard-delete Pull Requests. "
+            f"To completely scrub the unverified commit history from the repository index, an administrator must "
+            f"open a ticket with GitHub Support requesting the total deletion of this PR.\n"
+            f"👉 [Submit a Support Ticket]({support_link})"
+        )
+
+        for pr in open_prs:
+            pr_num = pr["number"]
+            c_url = f"{_api_base()}/repos/{repo_name}/issues/{pr_num}/comments"
+            urllib.request.urlopen(urllib.request.Request(c_url, data=json.dumps({"body": msg}).encode(), headers={
+                "Authorization": f"Bearer {gh_token}",
+                "Accept": "application/vnd.github.v3+json",
+                "Content-Type": "application/json",
+            }))
+            p_url = f"{_api_base()}/repos/{repo_name}/pulls/{pr_num}"
+            urllib.request.urlopen(urllib.request.Request(p_url, data=json.dumps({"state": "closed"}).encode(), headers={
+                "Authorization": f"Bearer {gh_token}",
+                "Accept": "application/vnd.github.v3+json",
+                "Content-Type": "application/json",
+            }, method="PATCH"))
+            print(f"✅ Closed PR #{pr_num} and posted instructions to admins.")
+    except Exception as e:
+        print(f"⚠️  PR API teardown error: {e}")
+
+
+def perform_server_side_check(expected_cmd):
+    """Execute the server-side quality check command."""
+    print(f"\n⚙️ Executing server-side check: {expected_cmd}")
+    extra_header = None
+    key = "http.https://github.com/.extraheader"
+    try:
+        extra_header = subprocess.check_output(["git", "config", "--local", "--get", key]).decode().strip()
+        subprocess.check_call(["git", "config", "--local", "--unset", key])
+    except subprocess.CalledProcessError:
+        pass
+
+    try:
+        subprocess.check_call(expected_cmd, shell=True)
+        print("✅ Server-side check passed.")
+        return True
+    except subprocess.CalledProcessError:
+        print("❌ Server-side check failed. A zero-trust validation error occurred.")
+        return False
+    finally:
+        if extra_header:
+            subprocess.check_call(["git", "config", "--local", key, extra_header])
+
+
+def handle_rejection(ref_name, last_valid, gh_token, event):
+    """Revert the push and clean up PRs if necessary."""
+    print("\n-------------------------------------------------------")
+    print("REJECTED: One or more commits failed validation.")
+    print(f"WARNING: Obliterating invalid commits from branch {ref_name}")
+    print("-------------------------------------------------------")
+
+    if gh_token:
+        repo_name = os.environ.get("GITHUB_REPOSITORY") or event.get("repository", {}).get("full_name")
+        admins = os.environ.get("POW_ADMIN_HANDLES", "")
+        teardown_pr(repo_name, ref_name, gh_token, admins)
+
+    run("git config --global user.name github-actions[bot]")
+    run("git config --global user.email github-actions[bot]@users.noreply.github.com")
+    run(f"git push --force origin {last_valid}:refs/heads/{ref_name}")
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Main Logic
+# ---------------------------------------------------------------------------
+
+def main():
+    if os.environ.get("POW_ENFORCE", "").strip().lower() != "true":
+        print("⚠️  POW_ENFORCE is not \"true\" — validation is disabled.")
+        sys.exit(0)
+
+    gh_token = os.environ.get("GITHUB_TOKEN")
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    expected_cmd = os.environ.get("POW_CHECKS_CMD", "none")
+    expected_hash = hashlib.sha256(expected_cmd.encode()).hexdigest()
+
+    base_sha, head_sha, ref_name, event = resolve_commit_range()
+    commits_str = ""
     try:
         commits_str = run(f"git log {base_sha}..{head_sha} --format=%H")
     except Exception:
-        commits_str = ""
+        pass
 
     if not commits_str:
         print("No new commits to verify.")
@@ -196,163 +330,22 @@ def main():
 
     commits = commits_str.splitlines()
     commits.reverse()
-
     missing = 0
     last_valid = base_sha
 
     for commit in commits:
-        print(f"\n🔍 Verifying commit {commit}…")
-
-        pow_checks_b64 = run(f'git log -1 --format="%(trailers:key=PoW-Checks,valueonly)" {commit}')
-        tree_hash = run(f"git log -1 --format=%T {commit}")
-
-        # 1. Check trailer exists
-        if not pow_checks_b64:
-            print(f"❌ Commit {commit} missing required PoW-Checks trailer.")
+        if not verify_single_commit(commit, repo, gh_token, expected_hash):
             missing += 1
             break
-            
-        try:
-            bundle_json = base64.b64decode(pow_checks_b64).decode()
-            bundle = json.loads(bundle_json)
-            token = bundle["token"]
-            session = bundle["session"]
-            status = bundle["status"]
-            cmd_hash = bundle["checks_hash"]
-        except Exception:
-            print(f"❌ Commit {commit} PoW-Checks trailer is not valid base64 JSON.")
-            missing += 1
-            break
-            
-        if cmd_hash != expected_hash:
-            print(f"❌ Commit {commit} used incorrect POW_CHECKS_CMD (hash mismatch).")
-            missing += 1
-            break
-
-        # 2. Decode signature
-        sign_payload = f"{cmd_hash}|{tree_hash}|{session}|{status}"
-        try:
-            sig_raw = base64.b64decode(token)
-        except Exception:
-            print(f"❌ Commit {commit} token is not valid base64.")
-            missing += 1
-            break
-
-        # 3. Verify signature
-        username = get_github_username_for_commit(repo, commit, gh_token)
-        if not username:
-            print(f"❌ Cannot resolve GitHub username for commit {commit}.")
-            missing += 1
-            break
-        valid = verify_with_github_keys(sig_raw, sign_payload.encode(), username, gh_token)
-        if valid:
-            print(f"   ✅ Signature verified via GitHub SSH keys of {username}.")
-        else:
-            print(f"❌ No matching GitHub SSH key for commit {commit} (user: {username}).")
-            missing += 1
-            break
-
-        # 4. Cross-reference server-side attestation artifact
-        attestation = check_attestation_artifact(repo, session, expected_hash, gh_token)
-        if attestation is False:
-            print(f"❌ No server-side attestation found for session {session}.")
-            missing += 1
-            break
-
         last_valid = commit
 
-    # 5. Server-Side Zero-Trust Validation
     if missing == 0 and expected_cmd and expected_cmd != "none":
-        print(f"\n⚙️ Executing server-side check: {expected_cmd}")
-
-        # Temporarily hide GitHub token from scanners like Trufflehog
-        extra_header = None
-        try:
-            extra_header = subprocess.check_output(["git", "config", "--local", "--get", "http.https://github.com/.extraheader"]).decode().strip()
-            subprocess.check_call(["git", "config", "--local", "--unset", "http.https://github.com/.extraheader"])
-        except subprocess.CalledProcessError:
-            pass
-
-        try:
-            # We use subprocess.check_call so output streams directly to GitHub Actions console
-            subprocess.check_call(expected_cmd, shell=True)
-            print("✅ Server-side check passed.")
-        except subprocess.CalledProcessError:
-            print("❌ Server-side check failed. A zero-trust validation error occurred.")
+        if not perform_server_side_check(expected_cmd):
             missing += 1
-            last_valid = base_sha  # Revert the entire push
-        finally:
-            # Restore the header so git push works in the rejection path
-            if extra_header:
-                subprocess.check_call(["git", "config", "--local", "http.https://github.com/.extraheader", extra_header])
+            last_valid = base_sha
 
-    # ---- Rejection path ----
     if missing > 0:
-        print("\n-------------------------------------------------------")
-        print("REJECTED: One or more commits failed validation.")
-        print(f"WARNING: Obliterating invalid commits from branch {ref_name}")
-        print("-------------------------------------------------------")
-
-        if gh_token:
-            try:
-                repo_name = os.environ.get("GITHUB_REPOSITORY") or event.get("repository", {}).get("full_name")
-                owner = repo_name.split("/")[0]
-                
-                # Fetch open PRs linked to this branch
-                prs_url = f"{_api_base()}/repos/{repo_name}/pulls?head={owner}:{ref_name}&state=open"
-                req_prs = urllib.request.Request(prs_url, headers={
-                    "Authorization": f"Bearer {gh_token}",
-                    "Accept": "application/vnd.github.v3+json",
-                })
-                resp = urllib.request.urlopen(req_prs)
-                open_prs = json.loads(resp.read().decode())
-
-                admins = os.environ.get("POW_ADMIN_HANDLES", "")
-                tag = f"{admins} " if admins else ""
-                
-                # GitHub Support ticket link for hard-deleting the PR natively
-                support_link = "https://support.github.com/contact/general"
-
-                msg = (
-                    f"🚨 **Proof-of-Work Validation Failed**\n\n"
-                    f"{tag}This Pull Request received a commit containing an unverified or fraudulent "
-                    f"cryptographic signature.\n\n"
-                    f"_The PR has been automatically closed and the compromised branch pushed over._\n\n"
-                    f"**Manual Action Required:** GitHub does not provide an API to hard-delete Pull Requests. "
-                    f"To completely scrub the unverified commit history from the repository index, an administrator must "
-                    f"open a ticket with GitHub Support requesting the total deletion of this PR.\n"
-                    f"👉 [Submit a Support Ticket]({support_link})"
-                )
-
-                for pr in open_prs:
-                    pr_number = pr["number"]
-                    
-                    # Post Comment
-                    c_url = f"{_api_base()}/repos/{repo_name}/issues/{pr_number}/comments"
-                    req_c = urllib.request.Request(c_url, data=json.dumps({"body": msg}).encode(), headers={
-                        "Authorization": f"Bearer {gh_token}",
-                        "Accept": "application/vnd.github.v3+json",
-                        "Content-Type": "application/json",
-                    })
-                    urllib.request.urlopen(req_c)
-
-                    # Close PR
-                    p_url = f"{_api_base()}/repos/{repo_name}/pulls/{pr_number}"
-                    req_p = urllib.request.Request(p_url, data=json.dumps({"state": "closed"}).encode(), headers={
-                        "Authorization": f"Bearer {gh_token}",
-                        "Accept": "application/vnd.github.v3+json",
-                        "Content-Type": "application/json",
-                    }, method="PATCH")
-                    urllib.request.urlopen(req_p)
-
-                    print(f"✅ Closed PR #{pr_number} and posted GitHub Support instructions to admins.")
-            except Exception as e:
-                print(f"⚠️  PR API teardown error: {e}")
-
-        run("git config --global user.name github-actions[bot]")
-        run("git config --global user.email github-actions[bot]@users.noreply.github.com")
-        run(f"git push --force origin {last_valid}:refs/heads/{ref_name}")
-        sys.exit(1)
+        handle_rejection(ref_name, last_valid, gh_token, event)
 
     print("\n🎉 All commits have valid Proof-of-Work tokens and server attestations!")
 

@@ -30,14 +30,11 @@ jobs:
       - name: Verify Proof-of-Work Tokens
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          POW_ADMIN_HANDLES: ${{ secrets.POW_ADMIN_HANDLES }}
-          POW_GITHUB_API_URL: ${{ secrets.POW_GITHUB_API_URL }}
-          POW_CHECKS_CMD: 'docker run --rm -v "$(git rev-parse --show-toplevel)":/pwd trufflesecurity/trufflehog:latest filesystem /pwd --no-verification --fail'
-          # ---------------------------------------------------------------
-          # POW_ENFORCE controls whether validation is active.
-          # Ships as "false" so the initial setup push passes without errors.
-          # Change to "true" on your second commit (made with hooks running)
-          # to enable enforcement for all future pushes.
-          # ---------------------------------------------------------------
-          POW_ENFORCE: "true"
+          POW: >-
+            {
+              "checks_cmd": "docker run --rm -v \"$(git rev-parse --show-toplevel)\":/pwd trufflesecurity/trufflehog:latest filesystem /pwd --no-verification --fail",
+              "enforce": "false",
+              "admin_handles": "${{ secrets.POW_ADMIN_HANDLES }}",
+              "github_api_url": "${{ secrets.POW_GITHUB_API_URL }}"
+            }
         run: python3 .github/scripts/verify_pow.py

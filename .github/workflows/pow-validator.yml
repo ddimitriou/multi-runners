@@ -33,7 +33,7 @@ jobs:
           POW: >-
             {
               "checks_cmd": "docker run --rm -v \"$(git rev-parse --show-toplevel)\":/pwd trufflesecurity/trufflehog:latest filesystem /pwd --no-verification --fail",
-              "enforce": "false",
+              "enforce": "true",
               "admin_handles": "${{ secrets.POW_ADMIN_HANDLES }}",
               "github_api_url": "${{ secrets.POW_GITHUB_API_URL }}"
             }
